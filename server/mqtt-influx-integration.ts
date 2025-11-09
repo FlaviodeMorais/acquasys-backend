@@ -1,13 +1,10 @@
+// server/mqtt-influx-integration.ts
 import { mqttBroker, type MQTTSensorData } from "./mqtt-broker.js";
 import { influxDB } from "./influxdb-client.js";
-import { telegramBot } from "./telegram-service.js";
+import { telegramBot, type AlertData } from "./telegram-service.js";
 import { WebSocketServer, WebSocket } from "ws";
 import { formatInTimeZone } from "date-fns-tz";
 
-/**
- * Integração MQTT + InfluxDB + Telegram + WebSockets (backend do AcquaSys)
- * 🔁 Versão otimizada com comunicação bidirecional e keep-alive
- */
 class MQTTInfluxIntegration {
   private isInitialized = false;
   private wsServer: WebSocketServer | null = null;
@@ -21,46 +18,37 @@ class MQTTInfluxIntegration {
   };
 
   private lastAlertTimes: Record<string, number> = {};
-  private readonly ALERT_COOLDOWN = 10 * 60 * 1000; // 10 minutos
-  private readonly PING_INTERVAL = 30000; // 30s para manter socket ativo
+  private readonly ALERT_COOLDOWN = 10 * 60 * 1000;
+  private readonly PING_INTERVAL = 30_000;
 
   constructor() {
     this.initialize().catch((err) =>
-      console.error("Erro ao inicializar integração (constructor):", err)
+      console.error("Erro ao inicializar integração:", err)
     );
   }
 
-  /** Conecta o servidor WebSocket e habilita comunicação bilateral */
+  /** WebSocket setup */
   public setWebSocketServer(wss: WebSocketServer): void {
     this.wsServer = wss;
+    console.log("🌐 WebSocket ativo - aguardando conexões...");
 
-    console.log("🌐 WebSocket ativo - aguardando conexões de frontend...");
-
-    // Conexões
     wss.on("connection", (socket: WebSocket) => {
       console.log("✅ Cliente WebSocket conectado.");
-
-      // Envia status inicial
       socket.send(
         JSON.stringify({
           type: "welcome",
-          data: {
-            connected: true,
-            pumpAutoMode: this.systemConfig.pumpAutoMode,
-          },
+          data: { pumpAutoMode: this.systemConfig.pumpAutoMode },
         })
       );
 
-      // Recebe comandos do frontend (controle remoto)
-      socket.on("message", async (msg) => {
+      socket.on("message", (msg) => {
         try {
-          const { type, action } = JSON.parse(msg.toString());
-          if (type === "controlPump") {
-            console.log(`🕹️ Comando recebido via WebSocket: ${action}`);
-            this.controlPump(action);
+          const payload = JSON.parse(msg.toString());
+          if (payload?.type === "controlPump" && payload?.action) {
+            this.controlPump(payload.action);
           }
         } catch (err) {
-          console.error("⚠️ Erro ao interpretar mensagem WS:", err);
+          console.warn("⚠️ Erro ao processar mensagem WS:", err);
         }
       });
 
@@ -69,207 +57,154 @@ class MQTTInfluxIntegration {
       });
     });
 
-    // PING keep-alive automático
     setInterval(() => this.broadcast("ping", { ts: Date.now() }), this.PING_INTERVAL);
   }
 
-  /** Envia mensagem broadcast via WebSocket (com limpeza automática) */
   private broadcast(type: string, data: any): void {
     if (!this.wsServer) return;
     const message = JSON.stringify({ type, data, timestamp: new Date().toISOString() });
-
-    let active = 0;
-    let closed = 0;
-
     for (const client of this.wsServer.clients) {
-      try {
-        if (client.readyState === WebSocket.OPEN) {
-          client.send(message);
-          active++;
-        } else {
-          closed++;
-          client.terminate();
-        }
-      } catch (err) {
-        closed++;
-      }
+      if (client.readyState === WebSocket.OPEN) client.send(message);
     }
-
-    if (active > 0)
-      console.debug(`📡 Broadcast '${type}' enviado a ${active} cliente(s)` +
-        (closed > 0 ? ` (${closed} desconectado(s))` : ""));
   }
 
-  /** Inicialização completa (MQTT, Telegram, WS) */
   private async initialize(): Promise<void> {
     if (this.isInitialized) return;
     console.log("🔧 Inicializando integração MQTT + InfluxDB + Telegram...");
-
     this.setupMQTTEventHandlers();
     this.setupTelegramEventHandlers();
-
     await new Promise((r) => setTimeout(r, 1000));
     this.isInitialized = true;
-    console.log("✅ Integração inicializada e pronta.");
-
-    try {
-      await this.testTelegramConnection();
-    } catch (err) {
-      console.warn("⚠️ Falha ao conectar Telegram (não crítico):", err);
-    }
+    await this.testTelegramConnection();
+    console.log("✅ Integração inicializada.");
   }
 
-  /** Recebe dados do ESP32 via MQTT */
   private setupMQTTEventHandlers(): void {
     mqttBroker.on("sensorData", async (data: MQTTSensorData) => {
       try {
         this.automaticPumpControl(data);
         await this.checkAndSendAlerts(data);
-
         const efficiency = this.calculateEfficiency(data);
         data.efficiency = efficiency;
 
-        // Gravação no Influx
         if (influxDB?.writeSensorData) await influxDB.writeSensorData(data);
-
-        // Envio instantâneo ao frontend
-        this.broadcast("sensorData", {
-          ...data,
-          efficiency,
-          timestamp: new Date(data.timestamp).toISOString(),
-        });
-
+        this.broadcast("sensorData", { ...data, efficiency });
         this.previousWaterLevel = data.level;
       } catch (err) {
-        console.error("❌ Erro ao processar sensorData:", err);
+        console.error("❌ Erro processando sensorData:", err);
       }
-    });
-
-    mqttBroker.on("pumpStatus", (payload: any) => {
-      this.broadcast("pumpStatus", payload);
     });
   }
 
-  /** Controle automático da bomba (executa comandos MQTT e atualiza front) */
   private automaticPumpControl(data: MQTTSensorData): void {
     if (!this.systemConfig.pumpAutoMode) return;
-
     if (data.level <= this.systemConfig.lowWaterThreshold && !data.pump) {
-      console.log(`🤖 AUTO: Nível baixo (${data.level}%), ligando bomba...`);
       this.controlPump("on");
+      this.broadcast("pumpStatus", { pump: true });
     } else if (data.level >= this.systemConfig.highWaterThreshold && data.pump) {
-      console.log(`🤖 AUTO: Nível alto (${data.level}%), desligando bomba...`);
       this.controlPump("off");
+      this.broadcast("pumpStatus", { pump: false });
     }
   }
 
-  /** Telegram Bot - eventos e comandos remotos */
   private setupTelegramEventHandlers(): void {
-    telegramBot.on("pumpModeChange", async ({ mode }: any) => {
-      this.systemConfig.pumpAutoMode = mode === "auto";
-      mqttBroker.controlPump(mode === "auto" ? "AUTO" : "MANUAL");
-      await telegramBot.sendCommandResponse(`✅ <b>Modo ${mode}</b> ativado.`);
-      this.broadcast("systemConfig", { pumpAutoMode: this.systemConfig.pumpAutoMode });
-    });
-
     telegramBot.on("pumpControl", async ({ action }: any) => {
       this.controlPump(action);
-      await telegramBot.sendCommandResponse(`🚰 Bomba ${action.toUpperCase()} via Telegram`);
+      await telegramBot.sendCommandResponse(`🚰 Bomba ${action}`);
     });
   }
 
-  /** Envia comando da bomba ao ESP32 e frontend */
+  private calculateEfficiency(data: MQTTSensorData): number {
+    if (!data.pump || data.current <= 0.1) return 100;
+    const eff = (180 / (data.current * 220)) * 100;
+    return Math.max(0, Math.min(100, eff));
+  }
+
+  private async checkAndSendAlerts(data: MQTTSensorData): Promise<void> {
+    const now = Date.now();
+    const alerts: Array<{ type: "warning" | "critical"; message: string; key: string }> = [];
+    if (data.level < 10)
+      alerts.push({ type: "critical", message: `⚠️ Nível crítico: ${data.level.toFixed(1)}%`, key: "low" });
+    if (data.current > 5)
+      alerts.push({ type: "warning", message: `⚡ Corrente alta: ${data.current.toFixed(2)}A`, key: "current" });
+
+    for (const a of alerts) {
+      const last = this.lastAlertTimes[a.key] || 0;
+      if (now - last > this.ALERT_COOLDOWN) {
+        const vibrationValue =
+          typeof data.vibration === "object" ? data.vibration.rms ?? 0 : Number(data.vibration ?? 0);
+        const payload: AlertData = {
+          device: data.device ?? "unknown",
+          level: data.level,
+          current: data.current,
+          vibration: vibrationValue,
+          pumpStatus: data.pump,
+          alertType: a.type,
+          message: a.message,
+          timestamp: new Date(),
+        };
+        await telegramBot.sendAlert(payload);
+        this.lastAlertTimes[a.key] = now;
+        this.broadcast("systemAlert", payload);
+      }
+    }
+  }
+
+  private async testTelegramConnection(): Promise<void> {
+    try {
+      const ok = await telegramBot.testConnection();
+      if (ok) {
+        const payload: AlertData = {
+          device: "AcquaSys Backend",
+          level: 0,
+          current: 0,
+          vibration: 0,
+          pumpStatus: false,
+          alertType: "info",
+          message: `🚀 Sistema AcquaSys iniciado (${new Date().toLocaleString()})`,
+          timestamp: new Date(),
+        };
+        await telegramBot.sendAlert(payload);
+      }
+    } catch (err) {
+      console.warn("⚠️ Teste Telegram falhou:", err);
+    }
+  }
+
+  public async getLatestData(): Promise<{ mqtt: any; timestamp: string } | null> {
+    try {
+      if (influxDB?.getLatestReadings) {
+        const arr = await influxDB.getLatestReadings(1);
+        if (arr?.length) return { mqtt: arr[0], timestamp: new Date().toISOString() };
+      }
+      const cached = mqttBroker.getLatestSensorData?.();
+      if (cached) return { mqtt: cached, timestamp: new Date().toISOString() };
+      return null;
+    } catch {
+      return null;
+    }
+  }
+
+  public async getHistoricalData(hours = 24): Promise<any[]> {
+    try {
+      if (influxDB?.getLatestReadings) return (await influxDB.getLatestReadings(hours)) ?? [];
+      return [];
+    } catch {
+      return [];
+    }
+  }
+
   public controlPump(action: "on" | "off" | "auto" | "AUTO" | "MANUAL"): boolean {
     try {
       const topic = "acquasys/pump/control";
-      mqttBroker.publish(topic, action.toUpperCase());
-      console.log(`🚀 Comando MQTT enviado: ${action}`);
-      this.broadcast("pumpStatus", { pump: action === "on", action, source: "backend" });
+      mqttBroker.publish?.(topic, String(action));
+      this.broadcast("pumpStatus", { pump: String(action).toLowerCase() === "on", action });
       return true;
-    } catch (error) {
-      console.error("❌ Erro ao enviar comando da bomba:", error);
+    } catch {
       return false;
     }
   }
-
-  /** Cálculo de eficiência */
-  private calculateEfficiency(data: MQTTSensorData): number {
-    if (!data.pump || data.current <= 0.1) return 100;
-    const currentPower = data.current * 220;
-    const idealPower = 180;
-    let eff = (idealPower / currentPower) * 100;
-    if (data.vibration?.rms > 1.0) eff -= (data.vibration.rms - 1.0) * 10;
-    if (data.temperature < 15 || data.temperature > 40)
-      eff -= Math.abs(data.temperature - 27.5) * 0.5;
-    eff = Math.max(0, Math.min(100, eff));
-    this.systemConfig.efficiencyHistory.push(eff);
-    if (this.systemConfig.efficiencyHistory.length > 20)
-      this.systemConfig.efficiencyHistory.shift();
-    return (
-      this.systemConfig.efficiencyHistory.reduce((a, b) => a + b, 0) /
-      this.systemConfig.efficiencyHistory.length
-    );
-  }
-
-  /** Sistema de alertas automáticos */
-  private async checkAndSendAlerts(data: MQTTSensorData): Promise<void> {
-    const now = Date.now();
-    const alerts: { type: string; message: string; key: string }[] = [];
-
-    if (data.level < 10)
-      alerts.push({
-        type: "critical",
-        message: `⚠️ Nível crítico: ${data.level.toFixed(1)}%`,
-        key: "low_water",
-      });
-
-    if (data.current > 5)
-      alerts.push({
-        type: "warning",
-        message: `⚡ Corrente alta: ${data.current.toFixed(2)}A`,
-        key: "high_current",
-      });
-
-    for (const alert of alerts) {
-      const last = this.lastAlertTimes[alert.key] || 0;
-      if (now - last > this.ALERT_COOLDOWN) {
-        await telegramBot.sendAlert({
-          device: data.device,
-          alertType: alert.type,
-          message: alert.message,
-          timestamp: new Date(),
-        });
-        this.lastAlertTimes[alert.key] = now;
-        this.broadcast("systemAlert", alert);
-      }
-    }
-  }
-
-/** 🔎 Testa a conexão do bot Telegram no startup */
-private async testTelegramConnection(): Promise<void> {
-  try {
-    const isConnected = await telegramBot.testConnection();
-
-    if (isConnected) {
-      const version = process.env.npm_package_version || "1.0.0";
-      const timestamp = new Date().toLocaleString("pt-BR");
-
-      await telegramBot.sendAlert({
-        device: "AcquaSys Backend",
-        alertType: "info",
-        message: `🚀 Sistema AcquaSys v${version} iniciado com sucesso\n🕒 ${timestamp}\n📡 Monitoramento ativo.`,
-        timestamp: new Date(),
-      });
-
-      console.log("✅ Telegram conectado e mensagem de inicialização enviada com sucesso.");
-    } else {
-      console.warn("⚠️ TelegramBot não respondeu ao teste de conexão.");
-    }
-  } catch (error) {
-    console.error("❌ Erro ao testar conexão do TelegramBot:", error);
-  }
 }
-
 
 export const mqttInfluxIntegration = new MQTTInfluxIntegration();
 

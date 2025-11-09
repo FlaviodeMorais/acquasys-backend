@@ -8,15 +8,15 @@ interface TelegramMessage {
   parse_mode?: "HTML" | "Markdown";
 }
 
-interface AlertData {
+export interface AlertData {
+  alertType: "warning" | "critical" | "info";
+  message: string;
   device: string;
   level: number;
   current: number;
-  vibration: number;
+  vibration: number | { x: number; y: number; z: number; rms: number };
   pumpStatus: boolean;
   timestamp: Date;
-  alertType: "warning" | "critical" | "info";
-  message: string;
 }
 
 interface TelegramUpdate {
@@ -75,7 +75,12 @@ export class TelegramBotService extends EventEmitter {
       `📍 <b>Device:</b> ${alert.device}\n` +
       `💧 <b>Nível:</b> ${alert.level.toFixed(1)}%\n` +
       `⚡ <b>Corrente:</b> ${alert.current.toFixed(2)}A\n` +
-      `📳 <b>Vibração:</b> ${alert.vibration.toFixed(3)}G\n` +
+      `📳 <b>Vibração:</b> ${
+        typeof alert.vibration === "object"
+          ? (alert.vibration.rms ?? 0).toFixed(3)
+          : Number(alert.vibration ?? 0).toFixed(3)
+      }G\n` +
+
       `${pumpIcon} <b>Bomba:</b> ${alert.pumpStatus ? "LIGADA" : "DESLIGADA"}\n\n` +
       `📝 <b>Mensagem:</b> ${alert.message}\n` +
       `🕐 <b>Data/Hora:</b> ${timestamp}`

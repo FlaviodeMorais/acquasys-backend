@@ -1,18 +1,35 @@
 {
   "compilerOptions": {
+    /* === Saída e estrutura === */
+    "rootDir": ".",
+    "outDir": "dist",
+
+    /* === Compatibilidade com Node ESM === */
     "target": "ES2022",
     "module": "NodeNext",
     "moduleResolution": "NodeNext",
-    "rootDir": "server",
-    "outDir": "dist",
-    "esModuleInterop": true,
-    "forceConsistentCasingInFileNames": true,
+
+    /* === Qualidade e consistência === */
     "strict": true,
+    "esModuleInterop": true,
+    "allowSyntheticDefaultImports": true,
+    "forceConsistentCasingInFileNames": true,
     "skipLibCheck": true,
     "resolveJsonModule": true,
-    "allowSyntheticDefaultImports": true,
+
+    /* === Tipos globais === */
     "types": ["node"]
   },
-  "include": ["server/**/*.ts", "shared/**/*.ts"],
-  "exclude": ["node_modules", "dist", "client", "**/*.test.ts"]
+  "include": [
+    "server/**/*.ts",
+    "shared/**/*.ts"
+  ],
+  "exclude": [
+    "node_modules",
+    "dist",
+    "client",
+    "server/drizzle.config.ts",
+    "**/*.test.ts"
+  ]
 }
+

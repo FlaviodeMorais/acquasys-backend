@@ -5,7 +5,7 @@ dotenv.config();
 console.log("✅ Porta do .env:", process.env.PORT);
 
 import express, { Request, Response, NextFunction } from "express";
-import { registerRoutes } from "./routes";
+import { registerRoutes } from "./routes.js";
 
 // ✅ Define um logger simples no lugar do 'log' do Vite
 const log = (...args: any[]) => console.log("[AcquaSys]", ...args);

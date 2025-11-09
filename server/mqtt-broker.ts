@@ -40,8 +40,8 @@ class MQTTBrokerService extends EventEmitter {
   private client: mqtt.MqttClient | null = null;
   private isConnected = false;
   private latestSensorData: MQTTSensorData | null = null;
-  
-  // Configuração aprimorada com suporte a autenticação via variáveis de ambiente
+
+  // Configuração aprimorada
   private readonly config;
 
   private readonly topics = {
@@ -49,7 +49,7 @@ class MQTTBrokerService extends EventEmitter {
     pumpControl: 'acquasys/pump/control',
     pumpStatus: 'acquasys/pump/status',
     systemStatus: 'acquasys/system/status',
-    alerts: 'acquasys/alerts' // Adicionado para consistência
+    alerts: 'acquasys/alerts',
   };
 
   constructor() {
@@ -57,33 +57,34 @@ class MQTTBrokerService extends EventEmitter {
 
     const host = process.env.MQTT_HOST || 'broker.mqtt-dashboard.com';
     const port = process.env.MQTT_PORT ? parseInt(process.env.MQTT_PORT, 10) : 1883;
-    
+
     this.config = {
       host,
       port,
       clientId: `acquasys_backend_${Math.random().toString(16).substr(2, 8)}`,
       clean: true,
       connectTimeout: 5000,
-      reconnectPeriod: 10000, // Tenta reconectar a cada 10 segundos
+      reconnectPeriod: 10000, // reconecta a cada 10s
       keepalive: 60,
       username: process.env.MQTT_USER,
       password: process.env.MQTT_PASS,
     };
-    
+
     if (!this.config.username) {
-        console.warn('⚠️ MQTT: Conectando a um broker público sem autenticação. Não recomendado para produção.');
+      console.warn('⚠️ MQTT: Conectando a broker pública sem autenticação (não recomendado em produção).');
     }
 
-    // Adiciona um pequeno delay para dar tempo aos outros serviços de iniciarem
+    // Pequeno delay para inicializar junto ao backend
     setTimeout(() => this.connect(), 2000);
   }
 
+  /** 🔗 Conecta ao broker MQTT */
   private connect(): void {
     console.log(`🔄 Conectando ao MQTT broker em mqtt://${this.config.host}:${this.config.port}...`);
-    
+
     try {
       this.client = mqtt.connect(this.config);
-      
+
       this.client.on('connect', () => {
         console.log('✅ MQTT conectado com sucesso');
         this.isConnected = true;
@@ -95,8 +96,6 @@ class MQTTBrokerService extends EventEmitter {
         this.handleMessage(topic, message);
       });
 
-      // CORREÇÃO: O erro agora é tratado de forma não-fatal.
-      // A aplicação não irá mais travar, e a biblioteca tentará reconectar sozinha.
       this.client.on('error', (error) => {
         console.error('⚠️ Erro MQTT:', error.message);
         this.isConnected = false;
@@ -104,13 +103,12 @@ class MQTTBrokerService extends EventEmitter {
       });
 
       this.client.on('close', () => {
-        if(this.isConnected) {
-            console.log('🔌 Conexão MQTT fechada.');
-            this.isConnected = false;
-            this.emit('disconnected');
+        if (this.isConnected) {
+          console.log('🔌 Conexão MQTT encerrada.');
+          this.isConnected = false;
+          this.emit('disconnected');
         }
       });
-
     } catch (error) {
       console.error('❌ Erro crítico ao iniciar conexão MQTT:', error);
       this.emit('error', error);
@@ -118,6 +116,7 @@ class MQTTBrokerService extends EventEmitter {
     }
   }
 
+  /** 🧭 Inscreve-se nos tópicos principais */
   private subscribeToTopics(): void {
     if (!this.client || !this.isConnected) return;
 
@@ -125,22 +124,23 @@ class MQTTBrokerService extends EventEmitter {
       this.topics.sensors,
       this.topics.pumpStatus,
       this.topics.systemStatus,
-      this.topics.alerts
+      this.topics.alerts,
     ];
 
     this.client.subscribe(topicsToSubscribe, { qos: 1 }, (error) => {
       if (error) {
         console.error(`❌ Erro ao subscrever aos tópicos:`, error);
       } else {
-        console.log(`📡 Subscrito aos tópicos: ${topicsToSubscribe.join(', ')}`);
+        console.log(`📡 Subscrito: ${topicsToSubscribe.join(', ')}`);
       }
     });
   }
 
+  /** 📩 Processa mensagens recebidas */
   private handleMessage(topic: string, message: Buffer): void {
     try {
       const data = JSON.parse(message.toString());
-      this.emit('message', topic, data); // Emite um evento genérico para o integration layer decidir
+      this.emit('message', topic, data);
 
       switch (topic) {
         case this.topics.sensors:
@@ -155,29 +155,47 @@ class MQTTBrokerService extends EventEmitter {
           break;
       }
     } catch (error) {
-      console.error(`❌ Erro ao processar mensagem MQTT no tópico ${topic}:`, error);
+      console.error(`❌ Erro ao processar mensagem em ${topic}:`, error);
     }
   }
 
+  /** ⚙️ Controla a bomba */
   public controlPump(action: 'on' | 'off' | 'AUTO' | 'MANUAL'): boolean {
     if (!this.client || !this.isConnected) {
-      console.error('❌ MQTT não conectado - não é possível controlar bomba');
+      console.error('❌ MQTT desconectado - não é possível controlar a bomba');
       return false;
     }
 
     this.client.publish(this.topics.pumpControl, action.toUpperCase(), { qos: 1 });
-    console.log(`🎮 Comando de bomba '${action.toUpperCase()}' publicado.`);
+    console.log(`🎮 Comando de bomba '${action.toUpperCase()}' enviado.`);
     return true;
   }
 
+  /** 📨 Publica mensagem genérica MQTT */
+  public publish(topic: string, message: string): void {
+    try {
+      if (!this.client || !this.isConnected) {
+        console.warn('⚠️ MQTT desconectado - publish ignorado');
+        return;
+      }
+      this.client.publish(topic, message, { qos: 0, retain: false });
+      console.log(`📤 MQTT → ${topic}: ${message}`);
+    } catch (error) {
+      console.error('❌ Erro ao publicar mensagem MQTT:', error);
+    }
+  }
+
+  /** 🔍 Últimos dados de sensor */
   public getLatestSensorData(): MQTTSensorData | null {
     return this.latestSensorData;
   }
 
+  /** 🧠 Status do cliente */
   public isClientConnected(): boolean {
     return this.isConnected;
   }
 
+  /** ℹ️ Info de conexão */
   public getConnectionInfo() {
     return {
       connected: this.isConnected,
@@ -187,15 +205,40 @@ class MQTTBrokerService extends EventEmitter {
     };
   }
 
+  /** 🔌 Desconecta do broker */
   public disconnect(): void {
     if (this.client) {
-      console.log('🔌 Desconectando MQTT...');
+      console.log('🔌 Desconectando do MQTT...');
       this.client.end();
       this.isConnected = false;
     }
   }
 
-  // ... (função publishTestData pode ser mantida como está)
+  /** 🧪 Publica dados de teste (debug) */
+  public publishTestData(): void {
+    if (!this.client || !this.isConnected) {
+      console.warn('⚠️ MQTT desconectado - não é possível enviar dados de teste.');
+      return;
+    }
+
+    const testPayload = JSON.stringify({
+      device: 'acquasys_esp32_test',
+      timestamp: Date.now(),
+      level: 50 + Math.random() * 30,
+      temperature: 24 + Math.random() * 5,
+      current: 2 + Math.random(),
+      flowRate: Math.random() * 30,
+      pump: Math.random() > 0.5,
+      efficiency: 80 + Math.random() * 10,
+      vibration: { x: 0.2, y: 0.3, z: 0.1, rms: 0.25 },
+      runtime: Math.random() * 1000,
+      heap: 350000,
+      rssi: -60,
+    });
+
+    this.client.publish(this.topics.sensors, testPayload, { qos: 0 });
+    console.log('🧪 Dados de teste MQTT publicados.');
+  }
 }
 
 // Singleton instance
